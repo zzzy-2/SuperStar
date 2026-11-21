@@ -64,8 +64,8 @@ jobs:
           -u "$CHAOXING_USERNAME"
           -p "$CHAOXING_PASSWORD"
           -l "$CHAOXING_COURSE_LIST"
-          -s 2
-          -j 2
+          -s 1
+          -j 1
 
       - name: 7. 上传日志（失败也上传）
         if: always()

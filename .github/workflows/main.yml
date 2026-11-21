@@ -47,15 +47,11 @@ jobs:
           model=$TIKU_MODEL
           min_interval_seconds=5
           http_proxy=
-          check_llm_connection=true
           submit=true
           cover_rate=0.8
           delay=1.0
           true_list=正确,对,√,是
           false_list=错误,错,×,否,不对,不正确
-          [notification]
-          provider=Bark
-          url=$NOTIFY_URL
           EOF
 
       - name: 6. 开始刷课

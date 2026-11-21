@@ -1,5 +1,8 @@
+import hashlib
+import html
 import json
 import re
+import unicodedata
 
 
 def parse_ai_answer(content, question_type):
@@ -27,21 +30,123 @@ def parse_ai_answer(content, question_type):
     return "\n".join(item.strip() for item in answers)
 
 
-def _matches_single_option(answer, options):
-    """A complete option may itself contain punctuation such as an enumeration comma."""
-    if not isinstance(answer, str) or not isinstance(options, str):
-        return False
-    target = re.sub(r"\s+", "", answer)
-    if not target:
-        return False
-    for option in options.splitlines():
-        option = option.strip()
-        # Chaoxing prefixes each extracted option with its letter.
-        option_text = re.sub(r"^[A-Za-z]\s*[.、:：)?）]?\s*", "", option)
-        for candidate in (option, option_text):
-            if candidate and re.sub(r"\s+", "", candidate) == target:
-                return True
-    return False
+def answer_cache_key(question):
+    """Scope cached answers to the exact title, type and option order."""
+    context = {key: question.get(key, "") for key in ("title", "type", "options")}
+    payload = json.dumps(context, ensure_ascii=False, sort_keys=True, default=str)
+    return "matched-v2:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _choice_text(value, cosmetic=False):
+    text = unicodedata.normalize("NFKC", html.unescape(str(value)))
+    text = re.sub(r"\s+", "", text)
+    if cosmetic:
+        # Preserve decimal points and numeric separators; normalize prose punctuation only.
+        text = re.sub(r"(?<!\d),|,(?!\d)|[。、]", "", text)
+    return text
+
+
+def _choice_options(options):
+    if not isinstance(options, str):
+        return None
+    parsed = {}
+    for line in options.splitlines():
+        if not line.strip():
+            continue
+        line = unicodedata.normalize("NFKC", html.unescape(line)).strip()
+        match = re.fullmatch(r"([A-Za-z])(?:[.、:：)）]\s*|\s+)?(.+)", line)
+        if not match or not match.group(2):
+            return None
+        label, text = match.group(1).upper(), match.group(2)
+        if label in parsed:
+            return None
+        parsed[label] = text
+    return parsed or None
+
+
+def _resolve_choice_item(value, options):
+    """Require a unique whole-option match or an unambiguous explicit option reference."""
+    value = unicodedata.normalize("NFKC", str(value)).strip()
+    if not value:
+        return None
+    matches = set()
+    for cosmetic in (False, True):
+        target = _choice_text(value, cosmetic)
+        matches = {label for label, text in options.items()
+                   if target and _choice_text(text, cosmetic) == target}
+        if matches:
+            break
+    references = set()
+    if re.fullmatch(r"[A-Za-z]", value):
+        label = value.upper()
+        if label in options:
+            references.add(label)
+    else:
+        explicit = re.fullmatch(r"([A-Za-z])(?:[.、:：)）]\s*|\s+)(.+)", value, flags=re.DOTALL)
+        if explicit:
+            label, text = explicit.group(1).upper(), explicit.group(2)
+            if label in options and any(
+                    _choice_text(text, soft) == _choice_text(options[label], soft)
+                    for soft in (False, True)):
+                references.add(label)
+    candidates = matches | references
+    return next(iter(candidates)) if len(candidates) == 1 else None
+
+
+def _letter_set(value, options):
+    if not re.fullmatch(r"[A-Za-z\s,，、#|;；/]+", value):
+        return None
+    letters = re.sub(r"[\s,，、#|;；/]+", "", value).upper()
+    if letters and all(letter in options for letter in letters):
+        return set(letters)
+    return None
+
+
+def resolve_answer(answer, question_type, options=None, true_list=None, false_list=None):
+    """Return a submission value only when the entire answer can be resolved; else None."""
+    if not isinstance(answer, str) or not answer.strip():
+        return None
+    value = answer.strip()
+    if question_type in ("single", "multiple"):
+        parsed = _choice_options(options)
+        if not parsed:
+            return None
+        whole = _resolve_choice_item(value, parsed)
+        if question_type == "single":
+            return whole
+        letters = _letter_set(unicodedata.normalize("NFKC", value), parsed)
+        if whole:
+            # Literal option text and compact letter references must not disagree.
+            if letters and letters != {whole}:
+                return None
+            return whole
+        if letters:
+            return "".join(sorted(letters))
+        parts = [value]
+        for separator in ("\n", "\r", "\t", "#", "|", ";", "；", ",", "，", "、"):
+            candidate = [item.strip() for item in value.split(separator) if item.strip()]
+            if len(candidate) > 1:
+                parts = candidate
+                break
+        resolved = [_resolve_choice_item(item, parsed) for item in parts]
+        if any(item is None for item in resolved):
+            return None
+        return "".join(sorted(set(resolved)))
+    if question_type == "judgement":
+        normalize = lambda item: unicodedata.normalize("NFKC", str(item)).strip().casefold()
+        positives = {normalize(item) for item in (true_list or [])}
+        negatives = {normalize(item) for item in (false_list or [])}
+        positives.update(("正确", "对", "是", "√", "true"))
+        negatives.update(("错误", "错", "否", "×", "false"))
+        normalized = normalize(value)
+        if normalized in positives and normalized not in negatives:
+            return "true"
+        if normalized in negatives and normalized not in positives:
+            return "false"
+        return None
+    if question_type in ("completion", "shortanswer"):
+        return value
+    return None
 
 
 def check_single(answer):
@@ -87,9 +192,9 @@ def check_completion(answer):
 
 
 def check_answer(answer, type, tiku, options=None):  # 只会写小杯代码，这里用个tiku感觉怪怪的，但先这么写着
+    if options is not None:
+        return resolve_answer(answer, type, options, tiku.true_list, tiku.false_list) is not None
     if type == 'single':
-        if _matches_single_option(answer, options):
-            return True
         if check_single(answer) and check_judgement(answer, tiku.true_list, tiku.false_list) == -1:
             return True
     elif type == 'multiple':

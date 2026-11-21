@@ -1,3 +1,49 @@
+import json
+import re
+
+
+def parse_ai_answer(content, question_type):
+    """Accept one answer string or an array without splitting strings into characters."""
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("AI message.content must be a nonempty string")
+    text = content.strip()
+    fenced = re.fullmatch(r"\x60{3}(?:json)?\s*(.*?)\s*\x60{3}", text, flags=re.DOTALL | re.IGNORECASE)
+    if fenced:
+        text = fenced.group(1).strip()
+    payload = json.loads(text)
+    if not isinstance(payload, dict) or "Answer" not in payload:
+        raise ValueError("AI response must be an object containing Answer")
+    value = payload["Answer"]
+    if isinstance(value, str):
+        answers = [value]
+    elif isinstance(value, list) and all(isinstance(item, str) for item in value):
+        answers = value
+    else:
+        raise ValueError("Answer must be a string or an array of strings")
+    if not answers or any(not item.strip() for item in answers):
+        raise ValueError("Answer must not be empty or contain blank items")
+    if question_type == "single" and len(answers) != 1:
+        raise ValueError("A single-choice question must have exactly one Answer item")
+    return "\n".join(item.strip() for item in answers)
+
+
+def _matches_single_option(answer, options):
+    """A complete option may itself contain punctuation such as an enumeration comma."""
+    if not isinstance(answer, str) or not isinstance(options, str):
+        return False
+    target = re.sub(r"\s+", "", answer)
+    if not target:
+        return False
+    for option in options.splitlines():
+        option = option.strip()
+        # Chaoxing prefixes each extracted option with its letter.
+        option_text = re.sub(r"^[A-Za-z]\s*[.、:：)?）]?\s*", "", option)
+        for candidate in (option, option_text):
+            if candidate and re.sub(r"\s+", "", candidate) == target:
+                return True
+    return False
+
+
 def check_single(answer):
     if answer is None:
         return False
@@ -40,8 +86,10 @@ def check_completion(answer):
         return False
 
 
-def check_answer(answer, type, tiku):  # 只会写小杯代码，这里用个tiku感觉怪怪的，但先这么写着
+def check_answer(answer, type, tiku, options=None):  # 只会写小杯代码，这里用个tiku感觉怪怪的，但先这么写着
     if type == 'single':
+        if _matches_single_option(answer, options):
+            return True
         if check_single(answer) and check_judgement(answer, tiku.true_list, tiku.false_list) == -1:
             return True
     elif type == 'multiple':

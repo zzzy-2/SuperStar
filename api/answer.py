@@ -16,7 +16,7 @@ import requests
 from openai import OpenAI
 from urllib3 import disable_warnings, exceptions
 
-from api.answer_check import check_answer, parse_ai_answer
+from api.answer_check import check_answer, parse_ai_answer, resolve_answer, answer_cache_key
 from api.logger import logger
 
 # 关闭警告
@@ -205,38 +205,48 @@ class Tiku:
             self.DISABLE = True
             return None
         
-    def query(self,q_info:dict) -> Optional[str]:
+    def query(self, q_info:dict) -> Optional[str]:
         if self.DISABLE:
             return None
 
-        # 预处理, 去除【单选题】这样与标题无关的字段
+        cache_key = answer_cache_key(q_info)
+        q_info = dict(q_info)
         logger.debug(f"原始标题：{q_info['title']}")
         q_info['title'] = sub(r'^\d+', '', q_info['title'])
         q_info['title'] = sub(r'（\d+\.\d+分）$', '', q_info['title'])
         logger.debug(f"处理后标题：{q_info['title']}")
 
-        # 先过缓存
+        def resolve(value):
+            return resolve_answer(
+                value, q_info['type'], q_info.get('options'), self.true_list, self.false_list)
+
         cache_dao = CacheDAO()
-        answer = cache_dao.get_cache(q_info['title'])
-        if answer:
-            logger.info(f"从缓存中获取答案：{q_info['title']} -> {answer}")
-            return answer.strip()
-        else:
-            answer = self._query(q_info)
-            if answer:
-                answer = answer.strip()
-                logger.info(f"从{self.name}获取答案：{q_info['title']} -> {answer}")
-                if check_answer(answer, q_info['type'], self, options=q_info.get('options')):
-                    cache_dao.add_cache(q_info['title'], answer)
-                    return answer
-                else:
-                    logger.info(f"从{self.name}获取到的答案类型与题目类型不符，已舍弃")
-                    return None
+        try:
+            cached = cache_dao.get_cache(cache_key)
+        except Exception as exc:
+            logger.warning("缓存读取异常（{}），继续查询题库", type(exc).__name__)
+            cached = None
+        if cached:
+            matched = resolve(cached)
+            if matched is not None:
+                logger.info("缓存答案已通过选项匹配：{} -> {}", q_info['title'], matched)
+                return cached.strip()
+            logger.warning("缓存答案无法对应当前选项，重新查询：{}", q_info['title'])
 
-            logger.error(f"从{self.name}获取答案失败：{q_info['title']}")
-        return None
+        answer = self._query(q_info)
+        matched = resolve(answer)
+        if matched is None:
+            logger.warning("所有可用题库均未返回可匹配答案，留空待人工检查：{}", q_info['title'])
+            return None
 
-
+        answer = answer.strip()
+        try:
+            cache_dao.add_cache(cache_key, answer)
+        except Exception as exc:
+            logger.warning("缓存写入异常（{}），继续使用已匹配答案", type(exc).__name__)
+        logger.info("从{}获取可匹配答案：{} -> {}（提交值={}）",
+                    self.name, q_info['title'], answer, matched)
+        return answer
 
     def _query(self, q_info:dict) -> Optional[str]:
         """
@@ -361,22 +371,24 @@ class TikuFallback(Tiku):
     def _query(self, q_info:dict) -> Optional[str]:
         for provider in self.providers:
             try:
-                answer = provider._query(q_info)
-            except Exception as e:
-                provider_id = f'{provider.name}({provider.__class__.__name__})'
-                logger.exception(f'{self.name} 查询时 {provider_id} 异常: {e}')
+                answer = provider._query(dict(q_info))
+            except Exception as exc:
+                logger.warning("{} 查询异常（{}），回退到下一个题库",
+                               provider.name, type(exc).__name__)
                 continue
             if not answer:
-                logger.info(f'{provider.name} 未命中，回退到下一个题库')
+                logger.info('{} 未命中，回退到下一个题库', provider.name)
                 continue
 
-            # 若当前题库返回答案但类型不符，则继续回退。
-            if check_answer(answer, q_info['type'], provider, options=q_info.get('options')):
-                logger.info(f'{provider.name} 命中答案')
+            matched = resolve_answer(
+                answer, q_info['type'], q_info.get('options'),
+                provider.true_list, provider.false_list)
+            if matched is not None:
+                logger.info("{} 命中且完成选项匹配，提交值={}", provider.name, matched)
                 return answer
 
             logger.warning(
-                '{} 返回答案类型不符，题型={}，返回值={!r}，回退到下一个题库',
+                '{} 返回答案未能对应具体选项或题型，题型={}，返回值={!r}，回退到下一个题库',
                 provider.name, q_info['type'], str(answer)[:500],
             )
         return None

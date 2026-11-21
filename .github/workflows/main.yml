@@ -41,7 +41,7 @@ jobs:
         run: |
           cat > config.ini <<EOF
           [tiku]
-          provider=AI
+          provider=TikuGo,TikuYanxi,AI
           endpoint=$TIKU_ENDPOINT
           key=$TIKU_KEY
           model=$TIKU_MODEL

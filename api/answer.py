@@ -16,7 +16,7 @@ import requests
 from openai import OpenAI
 from urllib3 import disable_warnings, exceptions
 
-from api.answer_check import check_answer
+from api.answer_check import check_answer, parse_ai_answer
 from api.logger import logger
 
 # 关闭警告
@@ -226,7 +226,7 @@ class Tiku:
             if answer:
                 answer = answer.strip()
                 logger.info(f"从{self.name}获取答案：{q_info['title']} -> {answer}")
-                if check_answer(answer, q_info['type'], self):
+                if check_answer(answer, q_info['type'], self, options=q_info.get('options')):
                     cache_dao.add_cache(q_info['title'], answer)
                     return answer
                 else:
@@ -371,11 +371,14 @@ class TikuFallback(Tiku):
                 continue
 
             # 若当前题库返回答案但类型不符，则继续回退。
-            if check_answer(answer, q_info['type'], provider):
+            if check_answer(answer, q_info['type'], provider, options=q_info.get('options')):
                 logger.info(f'{provider.name} 命中答案')
                 return answer
 
-            logger.info(f'{provider.name} 返回答案类型不符，回退到下一个题库')
+            logger.warning(
+                '{} 返回答案类型不符，题型={}，返回值={!r}，回退到下一个题库',
+                provider.name, q_info['type'], str(answer)[:500],
+            )
         return None
 
     def check_llm_connection(self) -> bool:
@@ -1092,12 +1095,15 @@ class AI(Tiku):
                 ]
             ))
 
+        content = ""
         try:
-            response = json.loads(remove_md_json_wrapper(completion.choices[0].message.content))
-            sep = "\n"
-            return sep.join(response['Answer']).strip()
-        except:
-            logger.error("无法解析大模型输出内容")
+            content = completion.choices[0].message.content
+            return parse_ai_answer(content, q_info['type'])
+        except (ValueError, TypeError, AttributeError, IndexError, KeyError) as exc:
+            logger.warning(
+                "无法解析大模型输出，题型={}，原因={}，原始内容={!r}",
+                q_info['type'], str(exc), str(content)[:500],
+            )
             return None
 
     def _init_tiku(self):
@@ -1217,8 +1223,7 @@ class SiliconFlow(Tiku):
             if response.status_code == 200:
                 result = response.json()
                 content = result['choices'][0]['message']['content']
-                parsed = json.loads(remove_md_json_wrapper(content))
-                return "\n".join(parsed['Answer']).strip()
+                return parse_ai_answer(content, q_info['type'])
             else:
                 logger.error(f"API请求失败：{response.status_code} {response.text}")
                 return None
